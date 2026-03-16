@@ -1,0 +1,41 @@
+# Rust build artifacts
+/target/
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# Cargo lock is kept; ignore generated lock for libraries if needed
+# Cargo.lock  # (uncomment if this is a library crate)
+
+# Data output
+logs/
+*.csv
+*.parquet
+*.repaired.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Credentials / GCS service account keys
+*.json
+*.pem
+*.key
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
