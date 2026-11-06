@@ -1,7 +1,14 @@
-mod aggTrade;
 mod orderbook;
+mod trade;
+mod units;
+mod bbo;
+mod recovery;
+use std::cell::Cell;
+use std::rc::Rc;
+use units::Units;
+use bbo::Quote;
 
-use crate::aggTrade::AggTradeSummary;
+use crate::trade::TradeSummary;
 use crate::orderbook::{
     OrderBookL2, TopN, fetch_depth_snapshot_blocking_with_body, on_binance_depth_update, MAX_LEVELS,
 };
@@ -26,14 +33,12 @@ enum Market {
 
 #[derive(Default)]
 struct State {
-    perp_usdt_depth_time: u64,
-    perp_usdt_agg_time: u64,
-    perp_usdc_depth_time: u64,
-    perp_usdc_agg_time: u64,
     perp_usdt_top10: TopN,
     perp_usdc_top10: TopN,
-    perp_usdt_agg: AggTradeSummary,
-    perp_usdc_agg: AggTradeSummary,
+    perp_usdt_trade: TradeSummary,
+    perp_usdc_trade: TradeSummary,
+    quotes: [Quote; 2],
+    last_written_prices: [Option<(i64, i64)>; 2],
 }
 
 fn now_epoch_ms() -> u64 {
@@ -41,10 +46,6 @@ fn now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_millis(0))
         .as_millis() as u64
-}
-
-fn max4(a: u64, b: u64, c: u64, d: u64) -> u64 {
-    a.max(b).max(c).max(d)
 }
 
 fn symbol_to_stream_symbol(symbol: &str) -> String {
@@ -182,7 +183,9 @@ fn connect_binance_ws_blocking(
 fn header() -> String {
     let mut cols: Vec<String> = Vec::new();
     cols.push("local_time".into());
-    cols.push("binance_time".into());
+    cols.push("binance_event_time".into());
+    cols.push("binance_transaction_time".into());
+    cols.push("event_type".into());
 
     for m in ["perp_usdt", "perp_usdc"] {
         for i in 1..=10 {
@@ -202,26 +205,50 @@ fn header() -> String {
     for m in ["perp_usdt", "perp_usdc"] {
         cols.push(format!("{m}_price"));
         cols.push(format!("{m}_quantity"));
-        cols.push(format!("{m}_normal_quantity"));
-        cols.push(format!("{m}_first_trade_id"));
-        cols.push(format!("{m}_last_trade_id"));
+        cols.push(format!("{m}_trade_id"));
         cols.push(format!("{m}_is_buyer_maker"));
+    }
+    for m in ["perp_usdt", "perp_usdc"] {
+        for field in ["best_bid_price", "best_ask_price", "best_bid_size", "best_ask_size", "best_update_id"] {
+            cols.push(format!("{m}_{field}"));
+        }
     }
     cols.join(",")
 }
 
-fn write_row(w: &mut BufWriter<File>, st: &State) -> std::io::Result<()> {
-    let local_time = now_epoch_ms();
-    let binance_time = max4(
-        st.perp_usdt_depth_time,
-        st.perp_usdt_agg_time,
-        st.perp_usdc_depth_time,
-        st.perp_usdc_agg_time,
-    );
+// All metadata belongs to the message that triggered this row, not the cached state.
+#[derive(Clone, Copy, Debug)]
+struct MessageMeta {
+    received_at_ms: u64,
+    event_time_ms: u64,
+    transaction_time_ms: u64,
+    event_type: &'static str,
+}
 
+impl Market {
+    fn index(self) -> usize { match self { Self::PerpUsdt => 0, Self::PerpUsdc => 1 } }
+    fn bbo_event_type(self) -> &'static str { match self { Self::PerpUsdt => "usdt_bbo", Self::PerpUsdc => "usdc_bbo" } }
+    fn event_type(self, is_trade: bool) -> &'static str {
+        match (self, is_trade) {
+            (Self::PerpUsdt, true) => "usdt_trade",
+            (Self::PerpUsdc, true) => "usdc_trade",
+            (Self::PerpUsdt, false) => "usdt_book",
+            (Self::PerpUsdc, false) => "usdc_book",
+        }
+    }
+}
+
+fn write_row(w: &mut BufWriter<File>, st: &mut State, meta: MessageMeta) -> std::io::Result<()> {
     let mut b1 = ItoaBuf::new();
     let mut b2 = ItoaBuf::new();
-    write!(w, "{},{}", b1.format(local_time), b2.format(binance_time))?;
+    let mut b3 = ItoaBuf::new();
+    write!(
+        w, "{},{},{},{}",
+        b1.format(meta.received_at_ms),
+        b2.format(meta.event_time_ms),
+        b3.format(meta.transaction_time_ms),
+        meta.event_type,
+    )?;
 
     fn write_top10(w: &mut BufWriter<File>, t: &TopN) -> std::io::Result<()> {
         for i in 0..10 {
@@ -241,23 +268,27 @@ fn write_row(w: &mut BufWriter<File>, st: &State) -> std::io::Result<()> {
     write_top10(w, &st.perp_usdt_top10)?;
     write_top10(w, &st.perp_usdc_top10)?;
 
-    fn write_agg(w: &mut BufWriter<File>, a: &AggTradeSummary) -> std::io::Result<()> {
+    fn write_trade(w: &mut BufWriter<File>, a: &TradeSummary) -> std::io::Result<()> {
         write!(w, ",{}", a.price)?;
         write!(w, ",{}", a.quantity)?;
-        write!(w, ",{}", a.normal_quantity)?;
-        write!(w, ",{}", a.first_trade_id)?;
-        write!(w, ",{}", a.last_trade_id)?;
+        write!(w, ",{}", a.trade_id)?;
         write!(w, ",{}", if a.is_buyer_maker { 1 } else { 0 })?;
         Ok(())
     }
-    write_agg(w, &st.perp_usdt_agg)?;
-    write_agg(w, &st.perp_usdc_agg)?;
+    write_trade(w, &st.perp_usdt_trade)?;
+    write_trade(w, &st.perp_usdc_trade)?;
 
+    for quote in st.quotes {
+        write!(w, ",{},{},{},{},{}", quote.bid, quote.ask, quote.bid_size, quote.ask_size, quote.update_id)?;
+    }
     writeln!(w)?;
+    st.last_written_prices = st.quotes.map(|q| q.prices());
     Ok(())
 }
 
-fn write_zero_row(w: &mut BufWriter<File>, n_cols: usize) -> std::io::Result<()> {
+fn write_zero_row(w: &mut BufWriter<File>, n_cols: usize, st: &mut State) -> std::io::Result<()> {
+    st.last_written_prices = [None; 2];
+    st.quotes = [Quote::default(); 2];
     // A "marker" row: all zeros, same number of columns as `header()`.
     if n_cols == 0 {
         return Ok(());
@@ -274,100 +305,41 @@ fn write_zero_row(w: &mut BufWriter<File>, n_cols: usize) -> std::io::Result<()>
 #[derive(Debug, Clone)]
 struct DepthUpdate {
     E: u64,
+    T: u64,
     U: u64,
     u: u64,
     pu: Option<u64>,
-    bids: Vec<(f64, f64)>,
-    asks: Vec<(f64, f64)>,
+    bids: Vec<(i64, i64)>,
+    asks: Vec<(i64, i64)>,
 }
 
 #[allow(non_snake_case)]
-fn parse_depth_update(v: &sonic_rs::Value, raw_payload: &[u8]) -> Result<DepthUpdate, String> {
+fn parse_depth_update(v: &sonic_rs::Value, _raw_payload: &[u8], units: Units) -> Result<DepthUpdate, String> {
     let payload = v.get("data").unwrap_or(v);
     let et = payload.get("e").and_then(|x| x.as_str()).unwrap_or("");
     if et != "depthUpdate" {
         return Err("not a depthUpdate event".to_string());
     }
-    let E = payload.get("E").and_then(|x| x.as_u64()).unwrap_or(0);
-    let U = payload.get("U").and_then(|x| x.as_u64()).unwrap_or(0);
-    let u = payload.get("u").and_then(|x| x.as_u64()).unwrap_or(0);
-    let pu = payload.get("pu").and_then(|x| x.as_u64());
+    let E = payload.get("E").and_then(|x| x.as_u64()).ok_or("missing depth E")?;
+    let T = payload.get("T").and_then(|x| x.as_u64()).ok_or("missing depth T")?;
+    let U = payload.get("U").and_then(|x| x.as_u64()).ok_or("missing depth U")?;
+    let u = payload.get("u").and_then(|x| x.as_u64()).ok_or("missing depth u")?;
+    let pu = Some(payload.get("pu").and_then(|x| x.as_u64()).ok_or("missing depth pu")?);
+    if U > u { return Err("invalid depth update range".into()); }
 
-    fn parse_side(x: Option<&sonic_rs::Value>, side_name: &str, raw_payload: &[u8]) -> Result<Vec<(f64, f64)>, String> {
-        let mut out = Vec::new();
-        let Some(arr) = x.and_then(|a| a.as_array()) else { return Ok(out) };
-        for (idx, row) in arr.iter().enumerate() {
-            let Some(cols) = row.as_array() else { continue };
-            if cols.len() < 2 {
-                continue;
-            }
-            let p_str = cols[0].as_str();
-            let q_str = cols[1].as_str();
-
-            let (p, p_ok) = if let Some(s) = p_str {
-                match s.parse::<f64>() {
-                    Ok(val) => {
-                        if val > 0.0 {
-                            (val, true)
-                        } else {
-                            (0.0, false)
-                        }
-                    }
-                    Err(_) => {
-                        let raw_snippet = String::from_utf8_lossy(&raw_payload[..raw_payload.len().min(1000)]);
-                        eprintln!(
-                            "[parse-error] {} price parse failed: side={} idx={} raw_price={:?} parsed_msg={}",
-                            side_name, side_name, idx, s, raw_snippet
-                        );
-                        return Err(format!("price parse failed at {}[{}]: {:?}", side_name, idx, s));
-                    }
-                }
-            } else {
-                let raw_snippet = String::from_utf8_lossy(&raw_payload[..raw_payload.len().min(1000)]);
-                eprintln!(
-                    "[parse-error] {} price missing: side={} idx={} parsed_msg={}",
-                    side_name, side_name, idx, raw_snippet
-                );
-                return Err(format!("price missing at {}[{}]", side_name, idx));
-            };
-
-            let q = if let Some(s) = q_str {
-                match s.parse::<f64>() {
-                    Ok(val) => val,
-                    Err(_) => {
-                        let raw_snippet = String::from_utf8_lossy(&raw_payload[..raw_payload.len().min(1000)]);
-                        eprintln!(
-                            "[parse-error] {} quantity parse failed: side={} idx={} raw_qty={:?} parsed_msg={}",
-                            side_name, side_name, idx, s, raw_snippet
-                        );
-                        return Err(format!("quantity parse failed at {}[{}]: {:?}", side_name, idx, s));
-                    }
-                }
-            } else {
-                let raw_snippet = String::from_utf8_lossy(&raw_payload[..raw_payload.len().min(1000)]);
-                eprintln!(
-                    "[parse-error] {} quantity missing: side={} idx={} parsed_msg={}",
-                    side_name, side_name, idx, raw_snippet
-                );
-                return Err(format!("quantity missing at {}[{}]", side_name, idx));
-            };
-
-            if !p_ok && p == 0.0 {
-                eprintln!(
-                    "[parse-warning] {} zero price detected: side={} idx={} qty={} (this might be a deletion)",
-                    side_name, side_name, idx, q
-                );
-            }
-
-            out.push((p, q));
-        }
-        Ok(out)
+    fn parse_side(x: Option<&sonic_rs::Value>, units: Units) -> Result<Vec<(i64, i64)>, String> {
+        let arr = x.and_then(|a| a.as_array()).ok_or("missing depth side")?;
+        arr.iter().map(|row| {
+            let px = row.get(0).and_then(|v| v.as_str()).ok_or("missing depth price")?;
+            let qty = row.get(1).and_then(|v| v.as_str()).ok_or("missing depth size")?;
+            Ok((units.price.units(px).map_err(|e| e.to_string())?, units.size.units(qty).map_err(|e| e.to_string())?))
+        }).collect()
     }
-
-    let bids = parse_side(payload.get("b"), "bids", raw_payload)?;
-    let asks = parse_side(payload.get("a"), "asks", raw_payload)?;
+    let bids = parse_side(payload.get("b"), units)?;
+    let asks = parse_side(payload.get("a"), units)?;
     Ok(DepthUpdate {
         E,
+        T,
         U,
         u,
         pu,
@@ -380,19 +352,18 @@ fn parse_depth_update(v: &sonic_rs::Value, raw_payload: &[u8]) -> Result<DepthUp
 // Connects to: wss://fstream.binance.com/public/stream?streams={symbol}@depth
 
 struct MarketConn {
+    recovery: Rc<Cell<bool>>,
+    units: Units,
     market: Market,
-    ws_host: &'static str,
     http_host: &'static str,
     http_path: &'static str,
     symbol: String,
-    ws_path: String,
 
     tls: StreamOwned<ClientConnection, std::net::TcpStream>,
     ws_buf: Vec<u8>,
     tmp: [u8; 16 * 1024],
 
     // reconnect/backoff
-    backoff_ms: u64,
     connected_at: Instant,
     last_rx_at: Instant,
     last_ping_at: Instant,
@@ -405,9 +376,9 @@ struct MarketConn {
     prev_u: u64,
     book: OrderBookL2<MAX_LEVELS>,
     buffered: Vec<DepthUpdate>,
+    sync_started_at: Instant,
 
     // ---- debug / one-time logs ----
-    printed_snapshot_json_once: bool,
     printed_first_depth_once: bool,
 
     // ---- warmup after reconnect ----
@@ -415,7 +386,7 @@ struct MarketConn {
 }
 
 impl MarketConn {
-    fn new(market: Market, symbol: &str) -> anyhow::Result<Self> {
+    fn new(market: Market, symbol: &str, units: Units, recovery: Rc<Cell<bool>>) -> anyhow::Result<Self> {
         let symbol = symbol.trim().to_ascii_uppercase();
         let stream_symbol = symbol_to_stream_symbol(&symbol);
         // Both PerpUsdt and PerpUsdc use the fstream endpoint.
@@ -423,7 +394,7 @@ impl MarketConn {
         let ws_host = "fstream.binance.com";
         let http_host = "fapi.binance.com";
         let http_path = "/fapi/v1/depth";
-        let ws_path = format!("/public/stream?streams={s}@depth", s = stream_symbol);
+        let ws_path = format!("/public/stream?streams={s}@depth@0ms", s = stream_symbol);
         eprintln!(
             "[ws] connecting {:?} {} host={} path={}",
             market, symbol, ws_host, ws_path
@@ -432,16 +403,15 @@ impl MarketConn {
         eprintln!("[ws] connected {:?} {}", market, symbol);
 
         let c = Self {
+            recovery,
+            units,
             market,
-            ws_host,
             http_host,
             http_path,
             symbol,
-            ws_path,
             tls,
             ws_buf: Vec::with_capacity(64 * 1024),
             tmp: [0u8; 16 * 1024],
-            backoff_ms: 100,
             connected_at: Instant::now(),
             last_rx_at: Instant::now(),
             last_ping_at: Instant::now(),
@@ -452,7 +422,7 @@ impl MarketConn {
             prev_u: 0,
             book: OrderBookL2::<MAX_LEVELS>::new(),
             buffered: Vec::with_capacity(1024),
-            printed_snapshot_json_once: false,
+            sync_started_at: Instant::now(),
             printed_first_depth_once: false,
             warmup_loop: false,
         };
@@ -469,6 +439,7 @@ impl MarketConn {
         self.snap_last_update_id = 0;
         self.book.clear();
         self.buffered.clear();
+        self.sync_started_at = Instant::now();
     }
 
     fn log_ob_err(&mut self, msg: &str) {
@@ -489,103 +460,30 @@ impl MarketConn {
         self.last_err_log_at = now;
     }
 
-    fn fetch_snapshot_after_first_u_with_retry(&mut self, first_u: u64) {
-        let mut backoff_ms: u64 = 250;
-        let mut rng = rand::thread_rng();
-        let mut printed_full = false;
-        let mut last_log_at = Instant::now() - Duration::from_secs(3600);
-        let mut suppressed: u64 = 0;
-        loop {
-            match fetch_depth_snapshot_blocking_with_body(
-                self.http_host,
-                self.http_path,
-                &self.symbol,
-                1000,
-            ) {
-                Ok((last, bids, asks, body)) => {
-                    if last < first_u {
-                        eprintln!(
-                            "[snapshot] {:?} {} too old: lastUpdateId={} < first_event.U={} (refetching...)",
-                            self.market, self.symbol, last, first_u
-                        );
-                        continue;
-                    }
-
-                    if !self.printed_snapshot_json_once {
-                        eprintln!(
-                            "[snapshot] {:?} {} fetched lastUpdateId={} ({} bytes)",
-                            self.market,
-                            self.symbol,
-                            last,
-                            body.len()
-                        );
-                        const LIM: usize = 64 * 1024;
-                        let s = String::from_utf8_lossy(&body);
-                        eprintln!(
-                            "[snapshot] {:?} {} json={}",
-                            self.market,
-                            self.symbol,
-                            trunc_str(&s, LIM)
-                        );
-                        self.printed_snapshot_json_once = true;
-                    }
-
-                    self.book.clear();
-                    on_binance_depth_update(&self.symbol, &mut self.book, last, last, None, &bids, &asks, 0);
-                    self.snap_last_update_id = last;
-                    self.book_ready = false;
-                    self.prev_u = 0;
-                    return;
-                }
-                Err(e) => {
-                    if !printed_full {
-                        eprintln!("[snapshot] {:?} {} failed: {e:#}", self.market, self.symbol);
-                        printed_full = true;
-                    } else {
-                        let now = Instant::now();
-                        if now.duration_since(last_log_at) < Duration::from_secs(1) {
-                            suppressed = suppressed.saturating_add(1);
-                        } else {
-                            if suppressed > 0 {
-                                eprintln!(
-                                    "[snapshot] {:?} {} still failing (suppressed {} msgs); retry in ~{}ms",
-                                    self.market, self.symbol, suppressed, backoff_ms
-                                );
-                                suppressed = 0;
-                            } else {
-                                eprintln!(
-                                    "[snapshot] {:?} {} still failing; retry in ~{}ms",
-                                    self.market, self.symbol, backoff_ms
-                                );
-                            }
-                            last_log_at = now;
-                        }
-                    }
-                    let jitter = rng.gen_range(0..(backoff_ms / 2).max(1));
-                    std::thread::sleep(Duration::from_millis(backoff_ms + jitter));
-                    backoff_ms = (backoff_ms * 3 / 2).min(10_000);
-                }
-            }
+    fn fetch_snapshot_after_first_u(&mut self, first_u: u64) -> anyhow::Result<()> {
+        eprintln!("[snapshot] {:?} {} fetching after symbol refresh", self.market, self.symbol);
+        let (last, bids, asks, _body) = fetch_depth_snapshot_blocking_with_body(
+            self.http_host, self.http_path, &self.symbol, 1000, self.units,
+        )?;
+        if last < first_u {
+            anyhow::bail!("snapshot lastUpdateId={last} precedes first event U={first_u}");
         }
+        self.book.clear();
+        on_binance_depth_update(&self.symbol, &mut self.book, last, last, None, &bids, &asks, 0);
+        self.snap_last_update_id = last;
+        self.book_ready = false;
+        self.prev_u = 0;
+        self.sync_started_at = Instant::now();
+        Ok(())
     }
 
-    fn reconnect(&mut self) -> anyhow::Result<()> {
-        eprintln!(
-            "[ws] reconnecting {:?} {} host={} path={}",
-            self.market, self.symbol, self.ws_host, self.ws_path
-        );
-        let tls = connect_binance_ws_blocking(self.ws_host, &self.ws_path)?;
-        self.tls = tls;
-        self.ws_buf.clear();
-        self.connected_at = Instant::now();
-        self.last_rx_at = Instant::now();
-        self.last_ping_at = Instant::now();
-        self.backoff_ms = 100;
-        self.book.clear();
-        self.reset_book_sync();
-        self.warmup_loop = true;
-        eprintln!("[ws] reconnected {:?} {}", self.market, self.symbol);
-        Ok(())
+    fn bridge_timed_out(&self) -> bool {
+        !self.book_ready && self.sync_started_at.elapsed() >= recovery::BRIDGE_TIMEOUT
+    }
+
+    fn request_reconnect(&self) {
+        eprintln!("[recovery] {:?} {} requested reconnect", self.market, self.symbol);
+        self.recovery.set(true);
     }
 
     fn try_bootstrap_from_buffer(&mut self) -> bool {
@@ -612,17 +510,18 @@ impl MarketConn {
             return false;
         }
 
-        // Perp: first event where U <= lastUpdateId <= u
-        let target = self.snap_last_update_id;
-        let mut bi = None;
-        for (i, ev) in self.buffered.iter().enumerate() {
-            if ev.U <= target && ev.u >= target {
-                bi = Some(i);
-                break;
+        let bi = match recovery::bridge_status(
+            self.snap_last_update_id,
+            self.buffered.iter().map(|ev| (ev.U, ev.u)),
+            self.sync_started_at.elapsed(),
+        ) {
+            recovery::Bridge::Ready(index) => index,
+            recovery::Bridge::Waiting => return false,
+            recovery::Bridge::Reconnect => {
+                self.log_ob_err("snapshot cannot be bridged (gap or timeout) -> reconnect");
+                self.recovery.set(true);
+                return false;
             }
-        }
-        let Some(bi) = bi else {
-            return false;
         };
         if bi > 0 {
             self.buffered.drain(0..bi);
@@ -636,11 +535,13 @@ impl MarketConn {
                     if pu != self.prev_u {
                         self.log_ob_err("bootstrap contiguity gap (pu) -> resync");
                         self.reset_book_sync();
+                        self.recovery.set(true);
                         return false;
                     }
                 } else if ev.U != self.prev_u + 1 {
                     self.log_ob_err("bootstrap contiguity gap (no pu) -> resync");
                     self.reset_book_sync();
+                    self.recovery.set(true);
                     return false;
                 }
             }
@@ -657,18 +558,24 @@ impl MarketConn {
         // Perp always uses snapshot-based approach (no direct apply without snapshot).
         if !self.book_ready {
             if self.snap_last_update_id == 0 {
-                if self.buffered.len() >= 8192 {
+                if self.buffered.len() >= recovery::MAX_BUFFERED_DEPTH {
                     self.log_ob_err("pre-snapshot buffer overflow -> resync");
-                    self.reset_book_sync();
+                    self.recovery.set(true);
+                    return false;
                 }
                 let first_u = ev.U;
                 self.buffered.push(ev);
-                self.fetch_snapshot_after_first_u_with_retry(first_u);
+                if let Err(e) = self.fetch_snapshot_after_first_u(first_u) {
+                    eprintln!("[snapshot] {:?} {} failed: {e:#} -> refresh and reconnect", self.market, self.symbol);
+                    self.recovery.set(true);
+                    return false;
+                }
                 return self.try_bootstrap_from_buffer();
             }
 
-            if self.buffered.len() >= 8192 {
-                self.log_ob_err("pre-bridge buffer overflow -> resync");
+            if self.buffered.len() >= recovery::MAX_BUFFERED_DEPTH {
+                self.log_ob_err("pre-bridge buffer overflow -> reconnect");
+                self.recovery.set(true);
                 self.reset_book_sync();
                 return false;
             }
@@ -718,16 +625,14 @@ impl MarketConn {
 // Connects to: wss://fstream.binance.com/public/stream?streams={symbol}@depth10@100ms
 
 struct Depth10Conn {
+    recovery: Rc<Cell<bool>>,
     market: Market,
-    ws_host: &'static str,
     symbol: String,
-    ws_path: String,
 
     tls: StreamOwned<ClientConnection, std::net::TcpStream>,
     ws_buf: Vec<u8>,
     tmp: [u8; 16 * 1024],
 
-    backoff_ms: u64,
     connected_at: Instant,
     last_rx_at: Instant,
     last_ping_at: Instant,
@@ -743,7 +648,7 @@ struct Depth10Conn {
 }
 
 impl Depth10Conn {
-    fn new(market: Market, symbol: &str) -> anyhow::Result<Self> {
+    fn new(market: Market, symbol: &str, recovery: Rc<Cell<bool>>) -> anyhow::Result<Self> {
         let symbol = symbol.trim().to_ascii_uppercase();
         let stream_symbol = symbol_to_stream_symbol(&symbol);
         // depth10@100ms now uses the /public/stream path on fstream.
@@ -757,14 +662,12 @@ impl Depth10Conn {
         eprintln!("[ws] connected depth10 {:?} {}", market, symbol);
 
         Ok(Self {
+            recovery,
             market,
-            ws_host,
             symbol,
-            ws_path,
             tls,
             ws_buf: Vec::with_capacity(64 * 1024),
             tmp: [0u8; 16 * 1024],
-            backoff_ms: 100,
             connected_at: Instant::now(),
             last_rx_at: Instant::now(),
             last_ping_at: Instant::now(),
@@ -777,25 +680,9 @@ impl Depth10Conn {
         })
     }
 
-    fn reconnect(&mut self) -> anyhow::Result<()> {
-        eprintln!(
-            "[ws] reconnecting depth10 {:?} {} host={} path={}",
-            self.market, self.symbol, self.ws_host, self.ws_path
-        );
-        let tls = connect_binance_ws_blocking(self.ws_host, &self.ws_path)?;
-        self.tls = tls;
-        self.ws_buf.clear();
-        self.connected_at = Instant::now();
-        self.last_rx_at = Instant::now();
-        self.last_ping_at = Instant::now();
-        self.backoff_ms = 100;
-        self.book.clear();
-        self.last_u = 0;
-        self.paused_u = None;
-        self.paused_at = Instant::now();
-        self.warmup_loop = true;
-        eprintln!("[ws] reconnected depth10 {:?} {}", self.market, self.symbol);
-        Ok(())
+    fn request_reconnect(&self) {
+        eprintln!("[recovery] {:?} {} requested reconnect", self.market, self.symbol);
+        self.recovery.set(true);
     }
 
     #[inline]
@@ -811,75 +698,59 @@ impl Depth10Conn {
     }
 }
 
-// ---- AggTradeConn: handles aggTrade for perp markets ----
-// Connects to the original endpoint: wss://fstream.binance.com/stream?streams={symbol}@aggTrade
+// ---- TradeConn: handles trade for perp markets ----
+// Connects to: wss://fstream.binance.com/public/stream?streams={symbol}@trade
 
-struct AggTradeConn {
+struct TradeConn {
+    recovery: Rc<Cell<bool>>,
     market: Market,
-    ws_host: &'static str,
     symbol: String,
-    ws_path: String,
 
     tls: StreamOwned<ClientConnection, std::net::TcpStream>,
     ws_buf: Vec<u8>,
     tmp: [u8; 16 * 1024],
 
-    backoff_ms: u64,
     connected_at: Instant,
     last_rx_at: Instant,
     last_ping_at: Instant,
 
-    printed_first_aggtrade_once: bool,
+    printed_first_trade_once: bool,
 
     // ---- warmup after reconnect ----
     warmup_loop: bool,
 }
 
-impl AggTradeConn {
-    fn new(market: Market, symbol: &str) -> anyhow::Result<Self> {
+impl TradeConn {
+    fn new(market: Market, symbol: &str, recovery: Rc<Cell<bool>>) -> anyhow::Result<Self> {
         let symbol = symbol.trim().to_ascii_uppercase();
         let stream_symbol = symbol_to_stream_symbol(&symbol);
         let ws_host = "fstream.binance.com";
-        let ws_path = format!("/stream?streams={s}@aggTrade", s = stream_symbol);
+        let ws_path = format!("/public/stream?streams={s}@trade/{s}@bookTicker", s = stream_symbol);
         eprintln!(
-            "[ws] connecting aggTrade {:?} {} host={} path={}",
+            "[ws] connecting trade {:?} {} host={} path={}",
             market, symbol, ws_host, ws_path
         );
         let tls = connect_binance_ws_blocking(ws_host, &ws_path)?;
-        eprintln!("[ws] connected aggTrade {:?} {}", market, symbol);
+        eprintln!("[ws] connected trade {:?} {}", market, symbol);
 
         Ok(Self {
+            recovery,
             market,
-            ws_host,
             symbol,
-            ws_path,
             tls,
             ws_buf: Vec::with_capacity(64 * 1024),
             tmp: [0u8; 16 * 1024],
-            backoff_ms: 100,
             connected_at: Instant::now(),
             last_rx_at: Instant::now(),
             last_ping_at: Instant::now(),
-            printed_first_aggtrade_once: false,
+            printed_first_trade_once: false,
             warmup_loop: false,
         })
     }
 
-    fn reconnect(&mut self) -> anyhow::Result<()> {
-        eprintln!(
-            "[ws] reconnecting aggTrade {:?} {} host={} path={}",
-            self.market, self.symbol, self.ws_host, self.ws_path
-        );
-        let tls = connect_binance_ws_blocking(self.ws_host, &self.ws_path)?;
-        self.tls = tls;
-        self.ws_buf.clear();
-        self.connected_at = Instant::now();
-        self.last_rx_at = Instant::now();
-        self.last_ping_at = Instant::now();
-        self.backoff_ms = 100;
-        self.warmup_loop = true;
-        eprintln!("[ws] reconnected aggTrade {:?} {}", self.market, self.symbol);
-        Ok(())
+    fn request_reconnect(&self) {
+        eprintln!("[recovery] {:?} {} requested reconnect", self.market, self.symbol);
+        self.recovery.set(true);
     }
 
     #[inline]
@@ -976,50 +847,98 @@ fn try_resolve_depth10_pause(depth0: &MarketConn, depth10: &mut Depth10Conn) -> 
     Some(true)
 }
 
+struct Session {
+    units: [Units; 2],
+    metadata: serde_json::Map<String, serde_json::Value>,
+    perp_usdt: MarketConn,
+    perp_usdc: MarketConn,
+    perp_usdt_d10: Depth10Conn,
+    perp_usdc_d10: Depth10Conn,
+    perp_usdt_trade: TradeConn,
+    perp_usdc_trade: TradeConn,
+}
+
+fn connect_session(symbols: &[String; 2], recovery: Rc<Cell<bool>>) -> anyhow::Result<Session> {
+    let perp_usdt_symbol = &symbols[0];
+    let perp_usdc_symbol = &symbols[1];
+    let exchange_info = orderbook::tls_http_get("fapi.binance.com", "/fapi/v1/exchangeInfo", 10000)?;
+    let exchange: sonic_rs::Value = sonic_rs::from_slice(&exchange_info)?;
+    let exchange_symbols = exchange.get("symbols").and_then(|v| v.as_array()).context("missing exchange symbols")?;
+    let mut metadata = serde_json::Map::new();
+    let mut symbol_units = Vec::new();
+    for symbol in [perp_usdt_symbol, perp_usdc_symbol] {
+        let entry = exchange_symbols.iter().find(|v| v.get("symbol").and_then(|v| v.as_str()) == Some(symbol.as_str()))
+            .with_context(|| format!("missing symbol {symbol}"))?;
+        symbol_units.push(Units::from_symbol(entry)?);
+        metadata.insert(symbol.to_string(), serde_json::from_str::<serde_json::Value>(&sonic_rs::to_string(entry)?)?["filters"].clone());
+    }
+    let units = [symbol_units[0], symbol_units[1]];
+    eprintln!("[recovery] symbol information refreshed for {} and {}", symbols[0], symbols[1]);
+    let mut session = Session {
+        units, metadata,
+        perp_usdt: MarketConn::new(Market::PerpUsdt, perp_usdt_symbol, units[0], recovery.clone())?,
+        perp_usdc: MarketConn::new(Market::PerpUsdc, perp_usdc_symbol, units[1], recovery.clone())?,
+        perp_usdt_d10: Depth10Conn::new(Market::PerpUsdt, perp_usdt_symbol, recovery.clone())?,
+        perp_usdc_d10: Depth10Conn::new(Market::PerpUsdc, perp_usdc_symbol, recovery.clone())?,
+        perp_usdt_trade: TradeConn::new(Market::PerpUsdt, perp_usdt_symbol, recovery.clone())?,
+        perp_usdc_trade: TradeConn::new(Market::PerpUsdc, perp_usdc_symbol, recovery)?,
+    };
+    session.perp_usdt.sync_started_at = Instant::now();
+    session.perp_usdc.sync_started_at = Instant::now();
+    Ok(session)
+}
+
+fn connect_session_with_retry(symbols: &[String; 2], recovery: Rc<Cell<bool>>) -> Session {
+    let mut backoff_ms = 250;
+    loop {
+        match connect_session(symbols, recovery.clone()) {
+            Ok(session) => return session,
+            Err(e) => {
+                eprintln!("[recovery] refresh/connect failed: {e:#}; retrying in ~{backoff_ms}ms");
+                let jitter = rand::thread_rng().gen_range(0..(backoff_ms / 2).max(1));
+                std::thread::sleep(Duration::from_millis(backoff_ms + jitter));
+                backoff_ms = (backoff_ms * 3 / 2).min(10_000);
+            }
+        }
+    }
+}
+
+fn open_output(base: &str, metadata: &serde_json::Map<String, serde_json::Value>) -> anyhow::Result<(BufWriter<File>, String)> {
+    fs::create_dir_all("logs")?;
+    let filename = format!("logs/{}_binance_{}.csv", now_epoch_ms(), base);
+    fs::write(format!("{filename}.units.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "format": "integer_ticks_lots_v1", "timestamp_unit": "unix_milliseconds",
+        "price_filter": "PRICE_FILTER.tickSize", "quantity_filter": "LOT_SIZE.stepSize", "symbols": metadata,
+    }))?)?;
+    let mut w = BufWriter::new(File::create(&filename)?);
+    writeln!(w, "{}", header())?;
+    w.flush()?;
+    Ok((w, filename))
+}
+
 fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let args: Vec<String> = std::env::args().collect();
     // Input base symbol like "BTC". We will collect:
-    // - <BASE>USDT perp (depth via /public/stream, aggTrade via /stream)
-    // - <BASE>USDC perp (depth via /public/stream, aggTrade via /stream)
+    // - <BASE>USDT perp (depth via /public/stream, trade via /public/stream)
+    // - <BASE>USDC perp (depth via /public/stream, trade via /public/stream)
     // - depth10@100ms for both perps via /public/stream
     let base = args.get(1).cloned().unwrap_or_else(|| "BTC".to_string());
     let base = base.trim().to_ascii_uppercase();
     let perp_usdt_symbol = format!("{base}USDT");
     let perp_usdc_symbol = format!("{base}USDC");
 
-    fs::create_dir_all("logs").context("create logs/")?;
-    let ts = now_epoch_ms();
-    let filename = format!("logs/{}_binance_{}.csv", ts, base);
-
-    let f = File::create(&filename).with_context(|| format!("create {filename}"))?;
-    let mut w = BufWriter::new(f);
-    let header_line = header();
-    let n_cols = header_line.split(',').count();
-    writeln!(w, "{}", header_line)?;
-    w.flush()?;
-
+    let symbols = [perp_usdt_symbol.clone(), perp_usdc_symbol.clone()];
+    let recovery = Rc::new(Cell::new(false));
+    let Session {
+        mut units, metadata, mut perp_usdt, mut perp_usdc,
+        mut perp_usdt_d10, mut perp_usdc_d10, mut perp_usdt_trade, mut perp_usdc_trade,
+    } = connect_session_with_retry(&symbols, recovery.clone());
+    let (mut w, filename) = open_output(&base, &metadata)?;
+    let n_cols = header().split(',').count();
     let mut st = State::default();
     let mut rows: u64 = 0;
-
-    // depth connections (via /public/stream)
-    let mut perp_usdt =
-        MarketConn::new(Market::PerpUsdt, &perp_usdt_symbol).context("perp_usdt connect")?;
-    let mut perp_usdc =
-        MarketConn::new(Market::PerpUsdc, &perp_usdc_symbol).context("perp_usdc connect")?;
-
-    // depth10@100ms connections (via /public/stream)
-    let mut perp_usdt_d10 =
-        Depth10Conn::new(Market::PerpUsdt, &perp_usdt_symbol).context("perp_usdt depth10 connect")?;
-    let mut perp_usdc_d10 =
-        Depth10Conn::new(Market::PerpUsdc, &perp_usdc_symbol).context("perp_usdc depth10 connect")?;
-
-    // aggTrade connections (via original /stream)
-    let mut perp_usdt_agg =
-        AggTradeConn::new(Market::PerpUsdt, &perp_usdt_symbol).context("perp_usdt aggTrade connect")?;
-    let mut perp_usdc_agg =
-        AggTradeConn::new(Market::PerpUsdc, &perp_usdc_symbol).context("perp_usdc aggTrade connect")?;
 
     let mut fds = [
         pollfd {
@@ -1043,12 +962,12 @@ fn main() -> anyhow::Result<()> {
             revents: 0,
         },
         pollfd {
-            fd: perp_usdt_agg.tls.get_ref().as_raw_fd(),
+            fd: perp_usdt_trade.tls.get_ref().as_raw_fd(),
             events: POLLIN,
             revents: 0,
         },
         pollfd {
-            fd: perp_usdc_agg.tls.get_ref().as_raw_fd(),
+            fd: perp_usdc_trade.tls.get_ref().as_raw_fd(),
             events: POLLIN,
             revents: 0,
         },
@@ -1062,6 +981,30 @@ fn main() -> anyhow::Result<()> {
     );
 
     loop {
+        if perp_usdt.bridge_timed_out() || perp_usdc.bridge_timed_out() {
+            eprintln!("[recovery] no valid snapshot bridge within 10 seconds");
+            recovery.set(true);
+        }
+        if recovery.get() {
+            write_zero_row(&mut w, n_cols, &mut st)?;
+            w.flush()?;
+            // Rebuild all streams as one generation; their cached integer units must agree.
+            let session = connect_session_with_retry(&symbols, recovery.clone());
+            units = session.units;
+            perp_usdt = session.perp_usdt;
+            perp_usdc = session.perp_usdc;
+            perp_usdt_d10 = session.perp_usdt_d10;
+            perp_usdc_d10 = session.perp_usdc_d10;
+            perp_usdt_trade = session.perp_usdt_trade;
+            perp_usdc_trade = session.perp_usdc_trade;
+            let (next_writer, next_filename) = open_output(&base, &session.metadata)?;
+            w = next_writer;
+            st = State::default();
+            rows = 0;
+            last_flush = Instant::now();
+            recovery.set(false);
+            eprintln!("[recovery] streams reopened with refreshed units; output={next_filename}");
+        }
         let now = Instant::now();
 
         // Check if any connection is in warmup mode (first loop after reconnect).
@@ -1070,43 +1013,45 @@ fn main() -> anyhow::Result<()> {
         // survives to the next iteration's drain phase and actually suppresses output.
         let any_warmup = perp_usdt.warmup_loop || perp_usdc.warmup_loop
             || perp_usdt_d10.warmup_loop || perp_usdc_d10.warmup_loop
-            || perp_usdt_agg.warmup_loop || perp_usdc_agg.warmup_loop;
+            || perp_usdt_trade.warmup_loop || perp_usdc_trade.warmup_loop;
         perp_usdt.warmup_loop = false;
         perp_usdc.warmup_loop = false;
         perp_usdt_d10.warmup_loop = false;
         perp_usdc_d10.warmup_loop = false;
-        perp_usdt_agg.warmup_loop = false;
-        perp_usdc_agg.warmup_loop = false;
+        perp_usdt_trade.warmup_loop = false;
+        perp_usdc_trade.warmup_loop = false;
 
         // keepalive pings
         perp_usdt.maybe_send_ping(now);
         perp_usdc.maybe_send_ping(now);
         perp_usdt_d10.maybe_send_ping(now);
         perp_usdc_d10.maybe_send_ping(now);
-        perp_usdt_agg.maybe_send_ping(now);
-        perp_usdc_agg.maybe_send_ping(now);
+        perp_usdt_trade.maybe_send_ping(now);
+        perp_usdc_trade.maybe_send_ping(now);
 
         // periodic connection rotation (Binance connection limits friendly)
         let rotate_after = Duration::from_secs(5 * 3600 + 50 * 60);
         let perp_usdt_rotate = now.duration_since(perp_usdt.connected_at) > rotate_after;
         let perp_usdc_rotate = now.duration_since(perp_usdc.connected_at) > rotate_after;
-        let perp_usdt_agg_rotate = now.duration_since(perp_usdt_agg.connected_at) > rotate_after;
-        let perp_usdc_agg_rotate = now.duration_since(perp_usdc_agg.connected_at) > rotate_after;
+        let perp_usdt_trade_rotate = now.duration_since(perp_usdt_trade.connected_at) > rotate_after;
+        let perp_usdc_trade_rotate = now.duration_since(perp_usdc_trade.connected_at) > rotate_after;
 
         // deadman timer: reconnect if no bytes received for a while
         let idle_timeout = Duration::from_secs(90);
         let perp_usdt_idle = now.duration_since(perp_usdt.last_rx_at) > idle_timeout;
         let perp_usdc_idle = now.duration_since(perp_usdc.last_rx_at) > idle_timeout;
-        let perp_usdt_agg_idle = now.duration_since(perp_usdt_agg.last_rx_at) > idle_timeout;
-        let perp_usdc_agg_idle = now.duration_since(perp_usdc_agg.last_rx_at) > idle_timeout;
+        let perp_usdt_d10_idle = now.duration_since(perp_usdt_d10.last_rx_at) > idle_timeout;
+        let perp_usdc_d10_idle = now.duration_since(perp_usdc_d10.last_rx_at) > idle_timeout;
+        let perp_usdt_trade_idle = now.duration_since(perp_usdt_trade.last_rx_at) > idle_timeout;
+        let perp_usdc_trade_idle = now.duration_since(perp_usdc_trade.last_rx_at) > idle_timeout;
 
         // refresh fds in case of reconnect
         fds[0].fd = perp_usdt.tls.get_ref().as_raw_fd();
         fds[1].fd = perp_usdc.tls.get_ref().as_raw_fd();
         fds[2].fd = perp_usdt_d10.tls.get_ref().as_raw_fd();
         fds[3].fd = perp_usdc_d10.tls.get_ref().as_raw_fd();
-        fds[4].fd = perp_usdt_agg.tls.get_ref().as_raw_fd();
-        fds[5].fd = perp_usdc_agg.tls.get_ref().as_raw_fd();
+        fds[4].fd = perp_usdt_trade.tls.get_ref().as_raw_fd();
+        fds[5].fd = perp_usdc_trade.tls.get_ref().as_raw_fd();
 
         let _ = unsafe { poll(fds.as_mut_ptr(), fds.len() as u64, 10) };
 
@@ -1122,27 +1067,18 @@ fn main() -> anyhow::Result<()> {
             }
 
             'read: loop {
+                if recovery.get() { break 'read; }
                 match d10.tls.read(&mut d10.tmp) {
                     Ok(0) => {
                         eprintln!("[ws] EOF depth10 {:?} {} -> reconnect", d10.market, d10.symbol);
-                        let mut rng = rand::thread_rng();
-                        loop {
-                            let jitter = rng.gen_range(0..(d10.backoff_ms / 2).max(1));
-                            std::thread::sleep(Duration::from_millis(d10.backoff_ms + jitter));
-                            match d10.reconnect() {
-                                Ok(_) => break,
-                                Err(_) => {
-                                    d10.backoff_ms = (d10.backoff_ms * 3 / 2).min(10_000);
-                                    continue;
-                                }
-                            }
-                        }
+                        d10.request_reconnect();
                         break 'read;
                     }
                     Ok(n) => {
                         d10.last_rx_at = Instant::now();
                         d10.ws_buf.extend_from_slice(&d10.tmp[..n]);
                         loop {
+                            if recovery.get() { break; }
                             let Ok((consumed, opcode, payload)) = parse_ws_frame(&d10.ws_buf) else {
                                 break;
                             };
@@ -1162,18 +1098,18 @@ fn main() -> anyhow::Result<()> {
                                                 d10.symbol,
                                                 trunc_str(payload_txt, 4096)
                                             );
-                                            d10.ws_buf.drain(..consumed);
-                                            continue;
+                                            recovery.set(true);
+                                            break;
                                         }
                                     };
                                     let payload_v = v.get("data").unwrap_or(&v);
                                     let stream = v.get("stream").and_then(|x| x.as_str()).unwrap_or("");
                                     let evt = payload_v.get("e").and_then(|x| x.as_str()).unwrap_or("");
                                     if evt == "depthUpdate" {
-                                        match parse_depth_update(&v, payload) {
+                                        match parse_depth_update(&v, payload, units[d10.market.index()]) {
                                             Ok(upd) => {
-                                                let bids_best_to_worst: Vec<(f64, f64)> = upd.bids.clone();
-                                                let asks_best_to_worst: Vec<(f64, f64)> = upd.asks.clone();
+                                                let bids_best_to_worst: Vec<(i64, i64)> = upd.bids.clone();
+                                                let asks_best_to_worst: Vec<(i64, i64)> = upd.asks.clone();
                                                 d10.book.from_snapshot(upd.E, &bids_best_to_worst, &asks_best_to_worst);
                                                 d10.last_u = upd.u;
                                                 if !d10.printed_first_depth10_once {
@@ -1201,23 +1137,7 @@ fn main() -> anyhow::Result<()> {
                                                             && maybe_compare_depth0_vs_depth10(&perp_usdt, d10)
                                                         {
                                                             eprintln!("[compare] perp_usdt depth mismatch -> reconnect");
-                                                            let mut rng = rand::thread_rng();
-                                                            loop {
-                                                                let jitter = rng.gen_range(0..(perp_usdt.backoff_ms / 2).max(1));
-                                                                std::thread::sleep(Duration::from_millis(perp_usdt.backoff_ms + jitter));
-                                                                match perp_usdt.reconnect() {
-                                                                    Ok(_) => {
-                                                                        st.perp_usdt_top10 = TopN::default();
-                                                                        let _ = write_zero_row(&mut w, n_cols);
-                                                                        rows += 1;
-                                                                        break;
-                                                                    }
-                                                                    Err(_) => {
-                                                                        perp_usdt.backoff_ms = (perp_usdt.backoff_ms * 3 / 2).min(10_000);
-                                                                        continue;
-                                                                    }
-                                                                }
-                                                            }
+                                                            perp_usdt.request_reconnect();
                                                         }
                                                     }
                                                     Market::PerpUsdc => {
@@ -1228,23 +1148,7 @@ fn main() -> anyhow::Result<()> {
                                                             && maybe_compare_depth0_vs_depth10(&perp_usdc, d10)
                                                         {
                                                             eprintln!("[compare] perp_usdc depth mismatch -> reconnect");
-                                                            let mut rng = rand::thread_rng();
-                                                            loop {
-                                                                let jitter = rng.gen_range(0..(perp_usdc.backoff_ms / 2).max(1));
-                                                                std::thread::sleep(Duration::from_millis(perp_usdc.backoff_ms + jitter));
-                                                                match perp_usdc.reconnect() {
-                                                                    Ok(_) => {
-                                                                        st.perp_usdc_top10 = TopN::default();
-                                                                        let _ = write_zero_row(&mut w, n_cols);
-                                                                        rows += 1;
-                                                                        break;
-                                                                    }
-                                                                    Err(_) => {
-                                                                        perp_usdc.backoff_ms = (perp_usdc.backoff_ms * 3 / 2).min(10_000);
-                                                                        continue;
-                                                                    }
-                                                                }
-                                                            }
+                                                            perp_usdc.request_reconnect();
                                                         }
                                                     }
                                                 }
@@ -1257,6 +1161,7 @@ fn main() -> anyhow::Result<()> {
                                                     e,
                                                     trunc_str(payload_txt, 4096)
                                                 );
+                                                recovery.set(true);
                                             }
                                         }
                                     }
@@ -1273,7 +1178,7 @@ fn main() -> anyhow::Result<()> {
                                         d10.symbol,
                                         payload.len()
                                     );
-                                    let _ = d10.reconnect();
+                                    d10.request_reconnect();
                                 }
                                 _ => {}
                             }
@@ -1292,7 +1197,7 @@ fn main() -> anyhow::Result<()> {
                             "[ws] read error depth10 {:?} {} -> reconnect",
                             d10.market, d10.symbol
                         );
-                        let _ = d10.reconnect();
+                        d10.request_reconnect();
                         break 'read;
                     }
                 }
@@ -1302,35 +1207,19 @@ fn main() -> anyhow::Result<()> {
         // ---- Drain perp depth sockets ----
         for c in [&mut perp_usdt, &mut perp_usdc] {
             loop {
+                if recovery.get() { break; }
                 match c.tls.read(&mut c.tmp) {
                     Ok(0) => {
                         eprintln!("[ws] EOF {:?} {} -> reconnect", c.market, c.symbol);
-                        let mut rng = rand::thread_rng();
-                        loop {
-                            let jitter = rng.gen_range(0..(c.backoff_ms / 2).max(1));
-                            std::thread::sleep(Duration::from_millis(c.backoff_ms + jitter));
-                            match c.reconnect() {
-                                Ok(_) => {
-                                    match c.market {
-                                        Market::PerpUsdt => st.perp_usdt_top10 = TopN::default(),
-                                        Market::PerpUsdc => st.perp_usdc_top10 = TopN::default(),
-                                    }
-                                    let _ = write_zero_row(&mut w, n_cols);
-                                    rows += 1;
-                                    break;
-                                }
-                                Err(_) => {
-                                    c.backoff_ms = (c.backoff_ms * 3 / 2).min(10_000);
-                                    continue;
-                                }
-                            }
-                        }
+                        c.request_reconnect();
                         break;
                     }
                     Ok(n) => {
+                        let received_at_ms = now_epoch_ms();
                         c.last_rx_at = Instant::now();
                         c.ws_buf.extend_from_slice(&c.tmp[..n]);
                         loop {
+                            if recovery.get() { break; }
                             let Ok((consumed, opcode, payload)) = parse_ws_frame(&c.ws_buf) else {
                                 break;
                             };
@@ -1349,15 +1238,15 @@ fn main() -> anyhow::Result<()> {
                                                 c.symbol,
                                                 trunc_str(payload_txt, 4096)
                                             );
-                                            c.ws_buf.drain(..consumed);
-                                            continue;
+                                            recovery.set(true);
+                                            break;
                                         }
                                     };
                                     let payload_v = v.get("data").unwrap_or(&v);
                                     let stream = v.get("stream").and_then(|x| x.as_str()).unwrap_or("");
                                     let evt = payload_v.get("e").and_then(|x| x.as_str()).unwrap_or("");
                                     if evt == "depthUpdate" {
-                                        match parse_depth_update(&v, payload) {
+                                        match parse_depth_update(&v, payload, units[c.market.index()]) {
                                             Ok(upd) => {
                                                 let applied = c.handle_depth_update(upd.clone());
                                                 if !c.printed_first_depth_once {
@@ -1391,7 +1280,6 @@ fn main() -> anyhow::Result<()> {
                                                     }
                                                     match c.market {
                                                         Market::PerpUsdt => {
-                                                            st.perp_usdt_depth_time = upd.E;
                                                             st.perp_usdt_top10 = top10;
                                                             if let Some(target_u) = perp_usdt_d10.paused_u {
                                                                 if c.prev_u >= target_u {
@@ -1409,7 +1297,6 @@ fn main() -> anyhow::Result<()> {
                                                             }
                                                         }
                                                         Market::PerpUsdc => {
-                                                            st.perp_usdc_depth_time = upd.E;
                                                             st.perp_usdc_top10 = top10;
                                                             if let Some(target_u) = perp_usdc_d10.paused_u {
                                                                 if c.prev_u >= target_u {
@@ -1427,8 +1314,14 @@ fn main() -> anyhow::Result<()> {
                                                             }
                                                         }
                                                     }
-                                                    if !any_warmup {
-                                                        write_row(&mut w, &st)?;
+                                                    st.quotes[c.market.index()].update_if_newer(Quote::from_top(&top10, upd.u));
+                                                    if !any_warmup && !recovery.get() {
+                                                        write_row(&mut w, &mut st, MessageMeta {
+                                                            received_at_ms,
+                                                            event_time_ms: upd.E,
+                                                            transaction_time_ms: upd.T,
+                                                            event_type: c.market.event_type(false),
+                                                        })?;
                                                         rows += 1;
                                                     }
                                                 } else if c.book_ready {
@@ -1468,49 +1361,11 @@ fn main() -> anyhow::Result<()> {
 
                             c.ws_buf.drain(..consumed);
                             if do_reconnect_after_drain {
-                                let mut rng = rand::thread_rng();
-                                loop {
-                                    let jitter = rng.gen_range(0..(c.backoff_ms / 2).max(1));
-                                    std::thread::sleep(Duration::from_millis(c.backoff_ms + jitter));
-                                    match c.reconnect() {
-                                        Ok(_) => {
-                                            match c.market {
-                                                Market::PerpUsdt => st.perp_usdt_top10 = TopN::default(),
-                                                Market::PerpUsdc => st.perp_usdc_top10 = TopN::default(),
-                                            }
-                                            let _ = write_zero_row(&mut w, n_cols);
-                                            rows += 1;
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            c.backoff_ms = (c.backoff_ms * 3 / 2).min(10_000);
-                                            continue;
-                                        }
-                                    }
-                                }
+                                c.request_reconnect();
                                 break;
                             }
                             if need_resync_after_drain {
-                                let mut rng = rand::thread_rng();
-                                loop {
-                                    let jitter = rng.gen_range(0..(c.backoff_ms / 2).max(1));
-                                    std::thread::sleep(Duration::from_millis(c.backoff_ms + jitter));
-                                    match c.reconnect() {
-                                        Ok(_) => {
-                                            match c.market {
-                                                Market::PerpUsdt => st.perp_usdt_top10 = TopN::default(),
-                                                Market::PerpUsdc => st.perp_usdc_top10 = TopN::default(),
-                                            }
-                                            let _ = write_zero_row(&mut w, n_cols);
-                                            rows += 1;
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            c.backoff_ms = (c.backoff_ms * 3 / 2).min(10_000);
-                                            continue;
-                                        }
-                                    }
-                                }
+                                c.request_reconnect();
                                 break;
                             }
                         }
@@ -1518,57 +1373,30 @@ fn main() -> anyhow::Result<()> {
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => {
                         eprintln!("[ws] read error {:?} {} -> reconnect", c.market, c.symbol);
-                        let mut rng = rand::thread_rng();
-                        loop {
-                            let jitter = rng.gen_range(0..(c.backoff_ms / 2).max(1));
-                            std::thread::sleep(Duration::from_millis(c.backoff_ms + jitter));
-                            match c.reconnect() {
-                                Ok(_) => {
-                                    match c.market {
-                                        Market::PerpUsdt => st.perp_usdt_top10 = TopN::default(),
-                                        Market::PerpUsdc => st.perp_usdc_top10 = TopN::default(),
-                                    }
-                                    let _ = write_zero_row(&mut w, n_cols);
-                                    rows += 1;
-                                    break;
-                                }
-                                Err(_) => {
-                                    c.backoff_ms = (c.backoff_ms * 3 / 2).min(10_000);
-                                    continue;
-                                }
-                            }
-                        }
+                        c.request_reconnect();
                         break;
                     }
                 }
             }
         }
 
-        // ---- Drain aggTrade sockets (original /stream endpoint) ----
-        for agg in [&mut perp_usdt_agg, &mut perp_usdc_agg] {
+        // ---- Drain trade sockets (/public/stream endpoint) ----
+        for trade in [&mut perp_usdt_trade, &mut perp_usdc_trade] {
             loop {
-                match agg.tls.read(&mut agg.tmp) {
+                if recovery.get() { break; }
+                match trade.tls.read(&mut trade.tmp) {
                     Ok(0) => {
-                        eprintln!("[ws] EOF aggTrade {:?} {} -> reconnect", agg.market, agg.symbol);
-                        let mut rng = rand::thread_rng();
-                        loop {
-                            let jitter = rng.gen_range(0..(agg.backoff_ms / 2).max(1));
-                            std::thread::sleep(Duration::from_millis(agg.backoff_ms + jitter));
-                            match agg.reconnect() {
-                                Ok(_) => break,
-                                Err(_) => {
-                                    agg.backoff_ms = (agg.backoff_ms * 3 / 2).min(10_000);
-                                    continue;
-                                }
-                            }
-                        }
+                        eprintln!("[ws] EOF trade {:?} {} -> reconnect", trade.market, trade.symbol);
+                        trade.request_reconnect();
                         break;
                     }
                     Ok(n) => {
-                        agg.last_rx_at = Instant::now();
-                        agg.ws_buf.extend_from_slice(&agg.tmp[..n]);
+                        let received_at_ms = now_epoch_ms();
+                        trade.last_rx_at = Instant::now();
+                        trade.ws_buf.extend_from_slice(&trade.tmp[..n]);
                         loop {
-                            let Ok((consumed, opcode, payload)) = parse_ws_frame(&agg.ws_buf) else {
+                            if recovery.get() { break; }
+                            let Ok((consumed, opcode, payload)) = parse_ws_frame(&trade.ws_buf) else {
                                 break;
                             };
                             let mut do_reconnect_after_drain = false;
@@ -1580,54 +1408,78 @@ fn main() -> anyhow::Result<()> {
                                         Ok(v) => v,
                                         Err(_) => {
                                             eprintln!(
-                                                "[ws] aggTrade {:?} {} invalid json: {}",
-                                                agg.market,
-                                                agg.symbol,
+                                                "[ws] trade {:?} {} invalid json: {}",
+                                                trade.market,
+                                                trade.symbol,
                                                 trunc_str(payload_txt, 4096)
                                             );
-                                            agg.ws_buf.drain(..consumed);
-                                            continue;
+                                            recovery.set(true);
+                                            break;
                                         }
                                     };
                                     let payload_v = v.get("data").unwrap_or(&v);
                                     let stream = v.get("stream").and_then(|x| x.as_str()).unwrap_or("");
                                     let evt = payload_v.get("e").and_then(|x| x.as_str()).unwrap_or("");
-                                    if evt == "aggTrade" {
-                                        let summary = crate::aggTrade::summarize_aggtrade_message(&v);
-                                        if !agg.printed_first_aggtrade_once {
+                                    if evt == "bookTicker" {
+                                        let parsed = (|| -> anyhow::Result<_> {
+                                            Ok((bbo::parse_quote(payload_v, units[trade.market.index()])?,
+                                                payload_v.get("E").and_then(|v| v.as_u64()).context("BBO missing E")?,
+                                                payload_v.get("T").and_then(|v| v.as_u64()).context("BBO missing T")?))
+                                        })();
+                                        let Some((quote, event_time_ms, transaction_time_ms)) = recovery::recover_on_error(parsed, &recovery, "BBO parse/conversion failed") else {
+                                            break;
+                                        };
+                                        let fresh = st.quotes[trade.market.index()].update_if_newer(quote);
+                                        if fresh && !any_warmup && !recovery.get() && quote.changed_from(st.last_written_prices[trade.market.index()]) {
+                                            write_row(&mut w, &mut st, MessageMeta {
+                                                received_at_ms,
+                                                event_time_ms,
+                                                transaction_time_ms,
+                                                event_type: trade.market.bbo_event_type(),
+                                            })?;
+                                            rows += 1;
+                                        }
+                                    } else if evt == "trade" {
+                                        let Some(summary) = recovery::recover_on_error(
+                                            crate::trade::parse_trade_message(&v, units[trade.market.index()]),
+                                            &recovery, "trade parse/conversion failed",
+                                        ) else { break; };
+                                        if !trade.printed_first_trade_once {
                                             eprintln!(
-                                                "[first-aggTrade] {:?} {} stream={} payload={}",
-                                                agg.market,
-                                                agg.symbol,
+                                                "[first-trade] {:?} {} stream={} payload={}",
+                                                trade.market,
+                                                trade.symbol,
                                                 stream,
                                                 trunc_str(payload_txt, 4096)
                                             );
                                             eprintln!(
-                                                "[first-aggTrade] {:?} {} E={} p={} q={} nq={} f={} l={} m={}",
-                                                agg.market,
-                                                agg.symbol,
+                                                "[first-trade] {:?} {} E={} T={} p={} q={} t={} m={}",
+                                                trade.market,
+                                                trade.symbol,
                                                 summary.event_time_ms,
+                                                summary.transaction_time_ms,
                                                 summary.price,
                                                 summary.quantity,
-                                                summary.normal_quantity,
-                                                summary.first_trade_id,
-                                                summary.last_trade_id,
+                                                summary.trade_id,
                                                 summary.is_buyer_maker
                                             );
-                                            agg.printed_first_aggtrade_once = true;
+                                            trade.printed_first_trade_once = true;
                                         }
-                                        match agg.market {
+                                        match trade.market {
                                             Market::PerpUsdt => {
-                                                st.perp_usdt_agg_time = summary.event_time_ms;
-                                                st.perp_usdt_agg = summary;
+                                                st.perp_usdt_trade = summary;
                                             }
                                             Market::PerpUsdc => {
-                                                st.perp_usdc_agg_time = summary.event_time_ms;
-                                                st.perp_usdc_agg = summary;
+                                                st.perp_usdc_trade = summary;
                                             }
                                         }
-                                        if !any_warmup {
-                                            write_row(&mut w, &st)?;
+                                        if !any_warmup && !recovery.get() {
+                                            write_row(&mut w, &mut st, MessageMeta {
+                                                received_at_ms,
+                                                event_time_ms: summary.event_time_ms,
+                                                transaction_time_ms: summary.transaction_time_ms,
+                                                event_type: trade.market.event_type(true),
+                                            })?;
                                             rows += 1;
                                         }
                                     } else {
@@ -1636,33 +1488,22 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 0x9 => {
                                     let pong = create_masked_control_frame(0x0A, payload);
-                                    let _ = agg.tls.write_all(&pong);
-                                    let _ = agg.tls.flush();
+                                    let _ = trade.tls.write_all(&pong);
+                                    let _ = trade.tls.flush();
                                 }
                                 0x8 => {
                                     eprintln!(
-                                        "[ws] close aggTrade {:?} {} ({} bytes)",
-                                        agg.market, agg.symbol, payload.len()
+                                        "[ws] close trade {:?} {} ({} bytes)",
+                                        trade.market, trade.symbol, payload.len()
                                     );
                                     do_reconnect_after_drain = true;
                                 }
                                 _ => {}
                             }
 
-                            agg.ws_buf.drain(..consumed);
+                            trade.ws_buf.drain(..consumed);
                             if do_reconnect_after_drain {
-                                let mut rng = rand::thread_rng();
-                                loop {
-                                    let jitter = rng.gen_range(0..(agg.backoff_ms / 2).max(1));
-                                    std::thread::sleep(Duration::from_millis(agg.backoff_ms + jitter));
-                                    match agg.reconnect() {
-                                        Ok(_) => break,
-                                        Err(_) => {
-                                            agg.backoff_ms = (agg.backoff_ms * 3 / 2).min(10_000);
-                                            continue;
-                                        }
-                                    }
-                                }
+                                trade.request_reconnect();
                                 break;
                             }
                         }
@@ -1670,21 +1511,10 @@ fn main() -> anyhow::Result<()> {
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => {
                         eprintln!(
-                            "[ws] read error aggTrade {:?} {} -> reconnect",
-                            agg.market, agg.symbol
+                            "[ws] read error trade {:?} {} -> reconnect",
+                            trade.market, trade.symbol
                         );
-                        let mut rng = rand::thread_rng();
-                        loop {
-                            let jitter = rng.gen_range(0..(agg.backoff_ms / 2).max(1));
-                            std::thread::sleep(Duration::from_millis(agg.backoff_ms + jitter));
-                            match agg.reconnect() {
-                                Ok(_) => break,
-                                Err(_) => {
-                                    agg.backoff_ms = (agg.backoff_ms * 3 / 2).min(10_000);
-                                    continue;
-                                }
-                            }
-                        }
+                        trade.request_reconnect();
                         break;
                     }
                 }
@@ -1697,38 +1527,40 @@ fn main() -> anyhow::Result<()> {
                 "[ws] perp_usdt {}",
                 if perp_usdt_rotate { "rotate -> reconnect" } else { "idle -> reconnect" }
             );
-            if perp_usdt.reconnect().is_ok() {
-                st.perp_usdt_top10 = TopN::default();
-                let _ = write_zero_row(&mut w, n_cols);
-                rows += 1;
-            }
+            perp_usdt.request_reconnect();
         }
         if perp_usdc_rotate || perp_usdc_idle {
             eprintln!(
                 "[ws] perp_usdc {}",
                 if perp_usdc_rotate { "rotate -> reconnect" } else { "idle -> reconnect" }
             );
-            if perp_usdc.reconnect().is_ok() {
-                st.perp_usdc_top10 = TopN::default();
-                let _ = write_zero_row(&mut w, n_cols);
-                rows += 1;
-            }
+            perp_usdc.request_reconnect();
         }
 
-        // Handle rotate / idle for aggTrade connections
-        if perp_usdt_agg_rotate || perp_usdt_agg_idle {
-            eprintln!(
-                "[ws] perp_usdt_agg {}",
-                if perp_usdt_agg_rotate { "rotate -> reconnect" } else { "idle -> reconnect" }
-            );
-            let _ = perp_usdt_agg.reconnect();
+        // Handle idle for depth10@100ms connections
+        if perp_usdt_d10_idle || now.duration_since(perp_usdt_d10.connected_at) > rotate_after {
+            eprintln!("[ws] perp_usdt_d10 idle -> reconnect");
+            perp_usdt_d10.request_reconnect();
         }
-        if perp_usdc_agg_rotate || perp_usdc_agg_idle {
+        if perp_usdc_d10_idle || now.duration_since(perp_usdc_d10.connected_at) > rotate_after {
+            eprintln!("[ws] perp_usdc_d10 idle -> reconnect");
+            perp_usdc_d10.request_reconnect();
+        }
+
+        // Handle rotate / idle for trade connections
+        if perp_usdt_trade_rotate || perp_usdt_trade_idle {
             eprintln!(
-                "[ws] perp_usdc_agg {}",
-                if perp_usdc_agg_rotate { "rotate -> reconnect" } else { "idle -> reconnect" }
+                "[ws] perp_usdt_trade {}",
+                if perp_usdt_trade_rotate { "rotate -> reconnect" } else { "idle -> reconnect" }
             );
-            let _ = perp_usdc_agg.reconnect();
+            perp_usdt_trade.request_reconnect();
+        }
+        if perp_usdc_trade_rotate || perp_usdc_trade_idle {
+            eprintln!(
+                "[ws] perp_usdc_trade {}",
+                if perp_usdc_trade_rotate { "rotate -> reconnect" } else { "idle -> reconnect" }
+            );
+            perp_usdc_trade.request_reconnect();
         }
 
         if rows % 100 == 0 || last_flush.elapsed() > Duration::from_secs(1) {
@@ -1736,4 +1568,108 @@ fn main() -> anyhow::Result<()> {
             last_flush = Instant::now();
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_use_triggering_message_metadata_even_when_other_market_is_newer() {
+        let path = std::env::temp_dir().join(format!("binance-row-test-{}.csv", std::process::id()));
+        let mut w = BufWriter::new(File::create(&path).unwrap());
+        let mut st = State::default();
+        st.perp_usdc_trade.event_time_ms = 9999;
+        writeln!(w, "{}", header()).unwrap();
+        for (market, is_trade, label) in [
+            (Market::PerpUsdt, true, "usdt_trade"),
+            (Market::PerpUsdc, true, "usdc_trade"),
+            (Market::PerpUsdt, false, "usdt_book"),
+            (Market::PerpUsdc, false, "usdc_book"),
+        ] {
+            assert_eq!(market.event_type(is_trade), label);
+            write_row(&mut w, &mut st, MessageMeta {
+                received_at_ms: 3000,
+                event_time_ms: 2000,
+                transaction_time_ms: 1999,
+                event_type: market.event_type(is_trade),
+            }).unwrap();
+        }
+        write_zero_row(&mut w, header().split(',').count(), &mut st).unwrap();
+        w.flush().unwrap();
+        let csv = fs::read_to_string(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        let lines: Vec<_> = csv.lines().collect();
+        for line in &lines[1..5] {
+            assert!(line.starts_with("3000,2000,1999,"));
+        }
+        for line in &lines[1..] {
+            assert_eq!(line.split(',').count(), lines[0].split(',').count());
+        }
+        assert!(lines[5].split(',').all(|v| v == "0"));
+    }
+
+    #[test]
+    fn depth_keeps_distinct_event_and_transaction_times() {
+        let raw = br#"{"data":{"e":"depthUpdate","E":2000,"T":1999,"U":10,"u":11,"pu":9,"b":[],"a":[]}}"#;
+        let v = sonic_rs::from_slice(raw).unwrap();
+        let update = parse_depth_update(&v, raw, Units { price: units::Step::new("0.1").unwrap(), size: units::Step::new("0.001").unwrap() }).unwrap();
+        assert_eq!((update.E, update.T), (2000, 1999));
+    }
+    #[test]
+    fn bbo_and_trade_conversion_errors_request_reconnect_without_exiting() {
+        let requested = Cell::new(false);
+        let unit = Units { price: units::Step::new("0.1").unwrap(), size: units::Step::new("0.001").unwrap() };
+        let quote = sonic_rs::from_str(r#"{"b":"100.01","a":"100.1","B":"1","A":"2","u":1}"#).unwrap();
+        assert!(recovery::recover_on_error(bbo::parse_quote(&quote, unit), &requested, "BBO test").is_none());
+        assert!(requested.replace(false));
+        let trade = sonic_rs::from_str(r#"{"e":"trade","E":1,"T":1,"p":"100.01","q":"1","t":1,"m":true}"#).unwrap();
+        assert!(recovery::recover_on_error(trade::parse_trade_message(&trade, unit), &requested, "trade test").is_none());
+        assert!(requested.get());
+    }
+
+    #[test]
+    fn live_recovery_refreshes_units_and_rebuilds_snapshot_after_failures() {
+        if std::env::var_os("BINANCE_LIVE_RECOVERY").is_none() { return; }
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let symbols = ["BTCUSDT".to_string(), "BTCUSDC".to_string()];
+        let requested = Rc::new(Cell::new(false));
+        let mut session = connect_session_with_retry(&symbols, requested.clone());
+        // Inject an off-tick BBO value through the production error handler.
+        let bad = sonic_rs::from_str(r#"{"b":"100.000000001","a":"101","B":"1","A":"1","u":1}"#).unwrap();
+        assert!(recovery::recover_on_error(bbo::parse_quote(&bad, session.units[0]), &requested, "injected BBO").is_none());
+        assert!(requested.get());
+        session = connect_session_with_retry(&symbols, requested.clone());
+        requested.set(false);
+        session.perp_usdt.fetch_snapshot_after_first_u(0).unwrap();
+        let target = session.perp_usdt.snap_last_update_id;
+        assert!(target > 0 && session.perp_usdt.book.bid_depth() > 0);
+        // An update that starts after the snapshot proves the bridge was missed.
+        session.perp_usdt.buffered.push(DepthUpdate {
+            E: 1, T: 1, U: target + 1, u: target + 2, pu: Some(target), bids: vec![], asks: vec![],
+        });
+        assert!(!session.perp_usdt.try_bootstrap_from_buffer());
+        assert!(requested.get());
+        session = connect_session_with_retry(&symbols, requested.clone());
+        requested.set(false);
+        session.perp_usdt.fetch_snapshot_after_first_u(0).unwrap();
+        let target = session.perp_usdt.snap_last_update_id;
+        session.perp_usdt.buffered.push(DepthUpdate {
+            E: 1, T: 1, U: target, u: target, pu: Some(target - 1), bids: vec![], asks: vec![],
+        });
+        assert!(session.perp_usdt.try_bootstrap_from_buffer());
+        assert!(session.perp_usdt.book_ready);
+        assert!(!requested.get());
+        // A later continuity gap also schedules recovery through the connection.
+        assert!(!session.perp_usdt.handle_depth_update(DepthUpdate {
+            E: 2, T: 2, U: target + 2, u: target + 3, pu: Some(target + 1), bids: vec![], asks: vec![],
+        }));
+        session.perp_usdt.request_reconnect();
+        assert!(requested.get());
+        session = connect_session_with_retry(&symbols, requested.clone());
+        session.perp_usdt.sync_started_at = Instant::now() - recovery::BRIDGE_TIMEOUT;
+        assert!(session.perp_usdt.bridge_timed_out());
+        println!("Live recovery passed: off-tick BBO, refreshed filters, snapshot gap, valid bridge, contiguity gap, and bridge timeout");
+    }
+
 }

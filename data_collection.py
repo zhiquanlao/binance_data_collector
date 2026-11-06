@@ -140,10 +140,15 @@ def build_column_types_from_header(csv_path: Path) -> Dict[str, pa.DataType]:
     with open(csv_path, "rb") as f:
         header = f.readline().decode("utf-8", errors="replace").strip()
     cols = header.split(",")
+    integer_units = "perp_usdt_best_bid_price" in cols
 
     types: Dict[str, pa.DataType] = {}
     for c in cols:
-        if c in ("local_time", "binance_time"):
+        if c == "event_type":
+            types[c] = pa.string()
+            continue
+
+        if c in ("local_time", "binance_time", "binance_event_time", "binance_transaction_time"):
             types[c] = pa.int64()
             continue
 
@@ -151,6 +156,7 @@ def build_column_types_from_header(csv_path: Path) -> Dict[str, pa.DataType]:
             c.endswith("_trade_count")
             or c.endswith("_taker_buy_count")
             or c.endswith("_taker_sell_count")
+            or c.endswith("_trade_id")
             or c.endswith("_first_trade_id")
             or c.endswith("_last_trade_id")
             or c.endswith("_transact_time")
@@ -162,7 +168,7 @@ def build_column_types_from_header(csv_path: Path) -> Dict[str, pa.DataType]:
             types[c] = pa.int8()
             continue
 
-        types[c] = pa.float64()
+        types[c] = pa.int64() if integer_units else pa.float64()
 
     return types
 
@@ -345,8 +351,12 @@ def repair_csv_by_column_count(
 
 # -------------------- CSV -> Parquet --------------------
 
-def csv_to_parquet(csv_path: Path, parquet_path: Path) -> None:
+def csv_to_parquet(csv_path: Path, parquet_path: Path, units_path: Optional[Path] = None) -> None:
     reader = csv_reader(csv_path)
+    units_path = units_path or Path(str(csv_path) + ".units.json")
+    unit_metadata = units_path.read_bytes() if units_path.exists() else None
+    if "perp_usdt_best_bid_price" in reader.schema.names and unit_metadata is None:
+        raise ValueError(f"Missing unit metadata: {units_path}")
     writer: Optional[pq.ParquetWriter] = None
 
     t0 = time.monotonic()
@@ -362,7 +372,7 @@ def csv_to_parquet(csv_path: Path, parquet_path: Path) -> None:
             if writer is None:
                 writer = pq.ParquetWriter(
                     parquet_path,
-                    batch.schema,
+                    batch.schema.with_metadata({**(batch.schema.metadata or {}), **({b"binance_units": unit_metadata} if unit_metadata else {})}),
                     compression=PARQUET_COMPRESSION,
                     use_dictionary=True,
                     write_statistics=True,
@@ -423,7 +433,7 @@ def process_and_upload_all_csv(client: storage.Client) -> None:
                 logging.warning("Repair complete for %s: skipped_bad_rows=%d", csv_path.name, skipped)
 
                 # convert repaired file
-                csv_to_parquet(repaired, parquet_path)
+                csv_to_parquet(repaired, parquet_path, Path(str(csv_path) + ".units.json"))
 
                 # remove repaired after successful conversion
                 repaired.unlink(missing_ok=True)
@@ -454,6 +464,7 @@ def process_and_upload_all_csv(client: storage.Client) -> None:
             continue
 
         # 4) cleanup
+        Path(str(csv_path) + ".units.json").unlink(missing_ok=True)
         csv_path.unlink(missing_ok=True)
         parquet_path.unlink(missing_ok=True)
         logging.info("Done: %s", csv_path.name)

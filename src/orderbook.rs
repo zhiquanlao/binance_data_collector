@@ -8,8 +8,8 @@ use std::io::{Read, Write};
 use std::{mem::MaybeUninit,ptr};
 use std::sync::Arc;
 
-pub type Price = f64;
-pub type Volume = f64;
+pub type Price = i64;
+pub type Volume = i64;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Side {
@@ -95,12 +95,9 @@ impl<const N: usize> OrderBookL2<N> {
 
     /// Maintains sorted levels (worst → best, best at end).
     pub fn update_level(&mut self, side: Side, price: Price, size: Volume) {
-        const PRICE_EPS: f64 = 1e-12;
-        const SIZE_EPS: f64 = 0.0;
+        const SIZE_EPS: i64 = 0;
     
-        // If NaNs can appear, decide your policy. This avoids totally broken ordering.
-        debug_assert!(price.is_finite());
-        debug_assert!(size.is_finite());
+        debug_assert!(price >= 0 && size >= 0);
     
         let (levels, depth) = match side {
             Side::Bid => (&mut self.bids, &mut self.bid_depth),
@@ -110,13 +107,13 @@ impl<const N: usize> OrderBookL2<N> {
         let n = *depth;
     
         // Find either:
-        //  - exact match (within eps), or
+        //  - exact match, or
         //  - insertion point (first element that should come *after* incoming)
         let mut ins = n;
         for i in 0..n {
             let px = unsafe { levels[i].assume_init_ref().price };
     
-            if (px - price).abs() < PRICE_EPS {
+            if px == price {
                 // found existing
                 if size <= SIZE_EPS {
                     // delete: shift left
@@ -136,8 +133,8 @@ impl<const N: usize> OrderBookL2<N> {
             }
     
             let should_insert_before = match side {
-                Side::Bid => px > price + PRICE_EPS, // bids are ascending (worst->best)
-                Side::Ask => px < price - PRICE_EPS, // asks are descending (worst->best)
+                Side::Bid => px > price, // bids are ascending (worst->best)
+                Side::Ask => px < price, // asks are descending (worst->best)
             };
     
             if should_insert_before {
@@ -155,8 +152,8 @@ impl<const N: usize> OrderBookL2<N> {
         if n == MAX_LEVELS {
             let worst_px = unsafe { levels[0].assume_init_ref().price };
             let incoming_is_better = match side {
-                Side::Bid => price > worst_px + PRICE_EPS,
-                Side::Ask => price < worst_px - PRICE_EPS,
+                Side::Bid => price > worst_px,
+                Side::Ask => price < worst_px,
             };
             if !incoming_is_better {
                 return;
@@ -188,7 +185,7 @@ impl<const N: usize> OrderBookL2<N> {
         *depth += 1;
     }
     
-    pub fn levels_best_to_worst(&self, side: Side) -> Vec<(f64, f64)> {
+    pub fn levels_best_to_worst(&self, side: Side) -> Vec<(i64, i64)> {
         let (arr, depth) = match side {
             Side::Bid => (&self.bids, self.bid_depth),
             Side::Ask => (&self.asks, self.ask_depth),
@@ -223,8 +220,8 @@ impl<const N: usize> OrderBookL2<N> {
     #[inline(always)]
     pub fn new_from_snapshot(
         ts_ms: u64,
-        bids_best_to_worst: &[(f64, f64)],
-        asks_best_to_worst: &[(f64, f64)],
+        bids_best_to_worst: &[(i64, i64)],
+        asks_best_to_worst: &[(i64, i64)],
     ) -> Self {
         let mut ob = Self::new();
         ob.from_snapshot(ts_ms, bids_best_to_worst, asks_best_to_worst);
@@ -235,10 +232,10 @@ impl<const N: usize> OrderBookL2<N> {
     pub fn from_snapshot(
         &mut self,
         ts_ms: u64,
-        bids_best_to_worst: &[(f64, f64)],
-        asks_best_to_worst: &[(f64, f64)],
+        bids_best_to_worst: &[(i64, i64)],
+        asks_best_to_worst: &[(i64, i64)],
     ) {
-        const SIZE_EPS: f64 = 0.0;
+        const SIZE_EPS: i64 = 0;
 
         self.ts_ms = ts_ms;
         self.bid_depth = 0;
@@ -295,10 +292,10 @@ impl<const N: usize> OrderBookL2<N> {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TopN {
-    pub bid_px: [f64; 10],
-    pub ask_px: [f64; 10],
-    pub bid_sz: [f64; 10],
-    pub ask_sz: [f64; 10],
+    pub bid_px: [i64; 10],
+    pub ask_px: [i64; 10],
+    pub bid_sz: [i64; 10],
+    pub ask_sz: [i64; 10],
 }
 
 /// Apply a Binance depthUpdate (bids/asks arrays) to a local fixed-depth book.
@@ -315,8 +312,8 @@ pub fn on_binance_depth_update<const N: usize>(
     U: u64,
     u: u64,
     pu: Option<u64>,
-    bids: &[(f64, f64)],
-    asks: &[(f64, f64)],
+    bids: &[(i64, i64)],
+    asks: &[(i64, i64)],
     event_time: u64,
 ) {
     // If you enforce contiguity in the caller, keep this function pure & fast.
@@ -325,7 +322,7 @@ pub fn on_binance_depth_update<const N: usize>(
 
     // Apply bids (desc) and asks (asc). We don't rely on order in the arrays;
     // OrderBookL2 will re-position as needed.
-    // NOTE: If Price/Volume are not f64 aliases, cast/convert accordingly.
+    // NOTE: If Price/Volume are not i64 aliases, cast/convert accordingly.
     for &(px, qty) in bids {
         binance_orderbook.update_level(Side::Bid, px as Price, qty as Volume);
     }
@@ -341,7 +338,7 @@ pub fn on_binance_depth_update<const N: usize>(
 
 // ---------------- REST snapshot parsing (blocking TLS HTTP GET) ----------------
 
-fn tls_http_get(host: &'static str, path: &str, timeout_ms: u64) -> anyhow::Result<Vec<u8>> {
+pub fn tls_http_get(host: &'static str, path: &str, timeout_ms: u64) -> anyhow::Result<Vec<u8>> {
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let cfg = ClientConfig::builder()
         .with_root_certificates(roots)
@@ -384,8 +381,9 @@ pub fn fetch_depth_snapshot_blocking(
     path: &str,
     symbol: &str,
     limit: u32,
-) -> anyhow::Result<(u64, Vec<(f64, f64)>, Vec<(f64, f64)>)> {
-    let (last, bids, asks, _body) = fetch_depth_snapshot_blocking_with_body(host, path, symbol, limit)?;
+    units: crate::units::Units,
+) -> anyhow::Result<(u64, Vec<(i64, i64)>, Vec<(i64, i64)>)> {
+    let (last, bids, asks, _body) = fetch_depth_snapshot_blocking_with_body(host, path, symbol, limit, units)?;
     Ok((last, bids, asks))
 }
 
@@ -394,7 +392,8 @@ pub fn fetch_depth_snapshot_blocking_with_body(
     path: &str,
     symbol: &str,
     limit: u32,
-) -> anyhow::Result<(u64, Vec<(f64, f64)>, Vec<(f64, f64)>, Vec<u8>)> {
+    units: crate::units::Units,
+) -> anyhow::Result<(u64, Vec<(i64, i64)>, Vec<(i64, i64)>, Vec<u8>)> {
     let sym_u = symbol.to_ascii_uppercase();
     let full_path = format!("{path}?symbol={sym_u}&limit={limit}");
     let body = tls_http_get(host, &full_path, 2500).context("tls_http_get")?;
@@ -419,33 +418,15 @@ pub fn fetch_depth_snapshot_blocking_with_body(
             )
         })?;
 
-    fn parse_side(v: &sonic_rs::Value, name: &str) -> anyhow::Result<Vec<(f64, f64)>> {
-        let arr = v
-            .get(name)
-            .and_then(|x| x.as_array())
-            .ok_or_else(|| anyhow!("missing {name}"))?;
-        let mut out = Vec::with_capacity(arr.len());
-        for row in arr {
-            let px = row
-                .get(0)
-                .and_then(|x| x.as_str())
-                .unwrap_or("0")
-                .parse::<f64>()
-                .unwrap_or(0.0);
-            let q = row
-                .get(1)
-                .and_then(|x| x.as_str())
-                .unwrap_or("0")
-                .parse::<f64>()
-                .unwrap_or(0.0);
-            out.push((px, q));
-        }
-        Ok(out)
+    fn parse_side(v: &sonic_rs::Value, name: &str, units: crate::units::Units) -> anyhow::Result<Vec<(i64, i64)>> {
+        let arr = v.get(name).and_then(|x| x.as_array()).ok_or_else(|| anyhow!("missing {name}"))?;
+        arr.iter().map(|row| {
+            let px = row.get(0).and_then(|x| x.as_str()).context("missing snapshot price")?;
+            let qty = row.get(1).and_then(|x| x.as_str()).context("missing snapshot size")?;
+            Ok((units.price.units(px)?, units.size.units(qty)?))
+        }).collect()
     }
-
-    let bids = parse_side(&v, "bids")
-        .with_context(|| format!("snapshot parse bids; host={host} path={full_path}; body_snip={body_snip:?}"))?;
-    let asks = parse_side(&v, "asks")
-        .with_context(|| format!("snapshot parse asks; host={host} path={full_path}; body_snip={body_snip:?}"))?;
+    let bids = parse_side(&v, "bids", units)?;
+    let asks = parse_side(&v, "asks", units)?;
     Ok((last, bids, asks, body))
 }

@@ -1,7 +1,7 @@
 # Binance Perp Data Collector
 
 A low-latency, perpetual-futures market data collector for Binance USD-M futures.  
-Streams live order book (depth + depth10@100ms) and aggregated trades (aggTrade) for multiple symbols simultaneously, writes tick-level CSV data locally, converts to Parquet, and uploads to Google Cloud Storage.
+Streams live order book (depth + depth10@100ms) and individual trades (trade) for multiple symbols simultaneously, writes tick-level CSV data locally, converts to Parquet, and uploads to Google Cloud Storage.
 
 ---
 
@@ -43,14 +43,14 @@ The project has two layers:
 
 | Connection | Endpoint |
 |---|---|
-| `perp_usdt` — depth | `fstream.binance.com/public/stream?streams={sym}usdt@depth` |
-| `perp_usdc` — depth | `fstream.binance.com/public/stream?streams={sym}usdc@depth` |
+| `perp_usdt` — depth | `fstream.binance.com/public/stream?streams={sym}usdt@depth@0ms` |
+| `perp_usdc` — depth | `fstream.binance.com/public/stream?streams={sym}usdc@depth@0ms` |
 | `perp_usdt_d10` — depth10@100ms | `fstream.binance.com/public/stream?streams={sym}usdt@depth10@100ms` |
 | `perp_usdc_d10` — depth10@100ms | `fstream.binance.com/public/stream?streams={sym}usdc@depth10@100ms` |
-| `perp_usdt_agg` — aggTrade | `fstream.binance.com/stream?streams={sym}usdt@aggTrade` |
-| `perp_usdc_agg` — aggTrade | `fstream.binance.com/stream?streams={sym}usdc@aggTrade` |
+| `perp_usdt_trade` — trade + bookTicker | `fstream.binance.com/public/stream?streams={sym}usdt@trade/{sym}usdt@bookTicker` |
+| `perp_usdc_trade` — trade + bookTicker | `fstream.binance.com/public/stream?streams={sym}usdc@trade/{sym}usdc@bookTicker` |
 
-The depth and depth10@100ms streams are compared on every matching update sequence number (`u`). A mismatch triggers an automatic reconnect and re-snapshot of the depth stream.
+The depth and depth10@100ms streams are compared on every matching update sequence number (`u`). A mismatch requests recovery of all six streams for the base symbol, with freshly loaded symbol filters and new REST snapshots.
 
 ---
 
@@ -59,8 +59,8 @@ The depth and depth10@100ms streams are compared on every matching update sequen
 For each symbol (e.g. BTC → BTCUSDT perp + BTCUSDC perp):
 
 - **Top-10 order book** (bid/ask price & size, levels 1–10) — updated on every depth event
-- **Aggregated trade summary** — price, quantity, normalised quantity, first/last trade ID, buyer-maker flag
-- **Timestamps** — `local_time` (collector wall clock, ms) and `binance_time` (latest event timestamp from Binance, ms)
+- **Individual trade** — price, quantity, trade ID, buyer-maker flag
+- **Timestamps** — `local_time` (local receipt time immediately after the socket read, ms), `binance_event_time` (`E`), and `binance_transaction_time` (`T`, trade/transaction time), all Unix milliseconds. Messages completed in the same read share its receipt time. Each row has an `event_type`: `usdc_trade`, `usdc_book`, `usdt_book`, `usdt_trade`, `usdc_bbo`, or `usdt_bbo`
 
 ---
 
@@ -85,20 +85,28 @@ Key properties:
 Each CSV file covers one symbol and one run of the collector. The header is:
 
 ```
-local_time, binance_time,
+local_time, binance_event_time, binance_transaction_time, event_type,
 perp_usdt_bid_price_{1..10}, perp_usdt_ask_price_{1..10},
 perp_usdt_bid_size_{1..10},  perp_usdt_ask_size_{1..10},
 perp_usdc_bid_price_{1..10}, perp_usdc_ask_price_{1..10},
 perp_usdc_bid_size_{1..10},  perp_usdc_ask_size_{1..10},
-perp_usdt_price, perp_usdt_quantity, perp_usdt_normal_quantity,
-perp_usdt_first_trade_id, perp_usdt_last_trade_id, perp_usdt_is_buyer_maker,
-perp_usdc_price, perp_usdc_quantity, perp_usdc_normal_quantity,
-perp_usdc_first_trade_id, perp_usdc_last_trade_id, perp_usdc_is_buyer_maker
+perp_usdt_price, perp_usdt_quantity, perp_usdt_trade_id, perp_usdt_is_buyer_maker,
+perp_usdc_price, perp_usdc_quantity, perp_usdc_trade_id, perp_usdc_is_buyer_maker,
+perp_usdt_best_bid_price, perp_usdt_best_ask_price, perp_usdt_best_bid_size, perp_usdt_best_ask_size, perp_usdt_best_update_id,
+perp_usdc_best_bid_price, perp_usdc_best_ask_price, perp_usdc_best_bid_size, perp_usdc_best_ask_size, perp_usdc_best_update_id
 ```
 
-**Reconnect marker rows:** whenever a reconnect occurs (mismatch detected, EOF, idle timeout, or scheduled rotation), a row of all **zeros** is written. Use `local_time == 0` as the filter condition to identify these marker rows in downstream analysis.
+All price and size/quantity columns are signed 64-bit integer counts: price / `PRICE_FILTER.tickSize` and quantity / `LOT_SIZE.stepSize`, loaded separately for each symbol from `/fapi/v1/exchangeInfo`. Parsing and division use checked decimal integer arithmetic throughout, with no floating point or rounding. Off-step values are rejected. Multiply a stored count by its step to recover the original value. Each CSV has a `<filename>.csv.units.json` sidecar containing its symbol filters; conversion embeds this JSON in Parquet metadata under `binance_units` and removes the sidecar after successful upload. Legacy decimal CSV files still use the old float schema.
 
-A row is emitted on every applied depth update or aggTrade event. The state snapshot written is always the latest known value for each field — i.e. the most recent depth book and the most recent trade summary at the time of the triggering event.
+The `best_*` columns contain the freshest valid quote for each market, including bid/ask prices, sizes, and `best_update_id`. Both depth and `bookTicker` use the exchange order-book update ID: an older update cannot replace a newer quote, and BBO takes precedence on equal IDs. A BBO row (`usdt_bbo` / `usdc_bbo`) is written only when either price differs from that market's effective prices in the last written row. Size-only changes update the cached sizes but do not emit rows. Changes in bid or ask prices with an unchanged midpoint do emit rows. Trade rows retain the freshest effective quotes. Reconnect markers clear the price baseline. The 10-level book columns continue to reflect depth updates only and may lag the effective quote.
+
+Recoverable conversion, JSON parsing, snapshot, and connection failures request recovery instead of terminating the collector or silently skipping a trade. Recovery re-fetches `/fapi/v1/exchangeInfo` for both markets before reopening the streams or requesting any REST snapshot. Refresh/connection failures retry with jittered backoff, capped at approximately 10 seconds plus jitter. All six streams and cached values for the base symbol are rebuilt together. Each successful recovery starts a new CSV segment and units sidecar, so updated tick/lot steps cannot change the interpretation of earlier rows.
+
+A depth snapshot is accepted only after a valid futures bridge (`U <= lastUpdateId <= u`) and contiguous subsequent updates (`pu == previous u`). Missing the bridge, failing to bridge within 10 seconds, exceeding the 8,192-event buffer, or detecting a sequence gap requests another refresh and reconnect. The timeout is checked even if no new messages arrive. Snapshot fetch/parse failures also restart this recovery sequence.
+
+**Reconnect marker rows:** whenever a reconnect occurs (mismatch detected, EOF, idle timeout, or scheduled rotation), a row of all **zeros** is written. Use `local_time == 0` as the filter condition to identify these marker rows in downstream analysis. The marker closes the old segment before recovery opens a new file.
+
+A row is emitted on every applied depth update, trade event, or bid/ask-price-changing BBO event (while recovery is not pending). The three timestamps refer only to the triggering message; they are never a maximum over streams. The depth10 stream only validates the book and does not emit rows. The state snapshot written is always the latest known value for each field — i.e. the most recent depth book and the most recent trade summary at the time of the triggering event.
 
 ---
 
@@ -182,7 +190,10 @@ binance_data_collector/
 ├── src/
 │   ├── main.rs          # Core WebSocket collector (Rust)
 │   ├── orderbook.rs     # Cache-friendly order book implementation
-│   └── aggTrade.rs      # Aggregated trade message parser
+│   ├── trade.rs         # Individual trade message parser
+│   ├── bbo.rs           # Effective quote freshness and bid/ask price filter
+│   ├── units.rs         # Exact decimal tick/lot conversion
+│   └── recovery.rs      # Snapshot bridge guards and recoverable parse errors
 ├── data_collection.py   # Python orchestrator (run this)
 ├── Cargo.toml
 ├── Cargo.lock
@@ -216,12 +227,12 @@ logs/
 
 | 连接 | 端点 |
 |---|---|
-| `perp_usdt` — depth | `fstream.binance.com/public/stream?streams={sym}usdt@depth` |
-| `perp_usdc` — depth | `fstream.binance.com/public/stream?streams={sym}usdc@depth` |
+| `perp_usdt` — depth | `fstream.binance.com/public/stream?streams={sym}usdt@depth@0ms` |
+| `perp_usdc` — depth | `fstream.binance.com/public/stream?streams={sym}usdc@depth@0ms` |
 | `perp_usdt_d10` — depth10@100ms | `fstream.binance.com/public/stream?streams={sym}usdt@depth10@100ms` |
 | `perp_usdc_d10` — depth10@100ms | `fstream.binance.com/public/stream?streams={sym}usdc@depth10@100ms` |
-| `perp_usdt_agg` — aggTrade | `fstream.binance.com/stream?streams={sym}usdt@aggTrade` |
-| `perp_usdc_agg` — aggTrade | `fstream.binance.com/stream?streams={sym}usdc@aggTrade` |
+| `perp_usdt_trade` — trade + bookTicker | `fstream.binance.com/public/stream?streams={sym}usdt@trade/{sym}usdt@bookTicker` |
+| `perp_usdc_trade` — trade + bookTicker | `fstream.binance.com/public/stream?streams={sym}usdc@trade/{sym}usdc@bookTicker` |
 
 每次 depth 和 depth10@100ms 的更新序列号（`u`）匹配时都会进行比对。若发现不一致，则自动触发重连并重新拉取 depth 快照。
 
@@ -232,8 +243,8 @@ logs/
 针对每个交易对（例如 BTC → BTCUSDT 永续 + BTCUSDC 永续）：
 
 - **订单簿前 10 档**（买卖价格及数量，1–10 档）— 每次 depth 事件后更新
-- **聚合成交摘要** — 成交价、成交量、标准化成交量、首/末成交 ID、买方为挂单方标志
-- **时间戳** — `local_time`（采集器本地时钟，毫秒）和 `binance_time`（币安最新事件时间戳，毫秒）
+- **逐笔成交** — 成交价、成交量、成交 ID（`t`）、买方为挂单方标志
+- **时间戳** — `local_time`（socket 读取后立即记录的本地接收时间，同一次读取完成的消息共用该时间）、`binance_event_time`（当前消息的 `E`）和 `binance_transaction_time`（当前消息的 `T`），单位均为 Unix 毫秒。`event_type` 为 `usdc_trade`、`usdc_book`、`usdt_book`、`usdt_trade`、`usdc_bbo` 或 `usdt_bbo`
 
 ---
 
@@ -258,20 +269,24 @@ logs/
 每个 CSV 文件对应一个交易对的一次运行。表头格式如下：
 
 ```
-local_time, binance_time,
+local_time, binance_event_time, binance_transaction_time, event_type,
 perp_usdt_bid_price_{1..10}, perp_usdt_ask_price_{1..10},
 perp_usdt_bid_size_{1..10},  perp_usdt_ask_size_{1..10},
 perp_usdc_bid_price_{1..10}, perp_usdc_ask_price_{1..10},
 perp_usdc_bid_size_{1..10},  perp_usdc_ask_size_{1..10},
-perp_usdt_price, perp_usdt_quantity, perp_usdt_normal_quantity,
-perp_usdt_first_trade_id, perp_usdt_last_trade_id, perp_usdt_is_buyer_maker,
-perp_usdc_price, perp_usdc_quantity, perp_usdc_normal_quantity,
-perp_usdc_first_trade_id, perp_usdc_last_trade_id, perp_usdc_is_buyer_maker
+perp_usdt_price, perp_usdt_quantity, perp_usdt_trade_id, perp_usdt_is_buyer_maker,
+perp_usdc_price, perp_usdc_quantity, perp_usdc_trade_id, perp_usdc_is_buyer_maker,
+perp_usdt_best_bid_price, perp_usdt_best_ask_price, perp_usdt_best_bid_size, perp_usdt_best_ask_size, perp_usdt_best_update_id,
+perp_usdc_best_bid_price, perp_usdc_best_ask_price, perp_usdc_best_bid_size, perp_usdc_best_ask_size, perp_usdc_best_update_id
 ```
+
+所有价格和数量列均保存为整数 tick/lot 数量，使用各交易对 `PRICE_FILTER.tickSize` 和 `LOT_SIZE.stepSize` 进行精确十进制整数除法，不使用浮点或四舍五入。步长保存在 CSV 的 `.units.json` 附件中，并写入 Parquet 的 `binance_units` 元数据。`best_*` 列记录最新有效最优买卖价格和数量；仅当 bookTicker 买价或卖价与上一行对应交易对的最新有效价格不同，才写入 BBO 行。仅数量变化不会写行。使用更新 ID 防止过期 depth 覆盖更新的 BBO；`best_update_id` 保存有效报价的更新 ID。
+
+转换、JSON 解析、快照或连接错误会触发恢复，不退出采集器。每次恢复先重新获取 USDT/USDC 交易对过滤信息，再重建所有 6 条连接和 REST 快照，并创建新的 CSV 及步长附件，避免同一文件混用不同步长。若无法桥接快照（`U <= lastUpdateId <= u`）、等待超过 10 秒、缓冲超过 8192 条或后续 `pu` 不连续，则再次恢复。
 
 **重连标记行：** 每当发生重连（发现不一致、连接断开、空闲超时或定时轮换）时，会写入一行全为**零**的数据作为标记。在下游分析中，可通过 `local_time == 0` 来筛选这些标记行。
 
-每次收到有效的 depth 更新或 aggTrade 事件时写出一行。写出的快照始终是各字段的最新已知值——即触发事件时最新的订单簿和最新的成交摘要。
+每次收到有效的 depth 更新或 trade 事件时写出一行。写出的快照始终是各字段的最新已知值——即触发事件时最新的订单簿和最新的成交摘要。
 
 ---
 
@@ -355,7 +370,10 @@ binance_data_collector/
 ├── src/
 │   ├── main.rs          # 核心 WebSocket 采集器（Rust）
 │   ├── orderbook.rs     # 缓存友好型订单簿实现
-│   └── aggTrade.rs      # 聚合成交消息解析
+│   ├── trade.rs         # 逐笔成交消息解析
+│   ├── bbo.rs           # 有效最优报价与买卖价格变化过滤
+│   ├── units.rs         # 精确十进制 tick/lot 转换
+│   └── recovery.rs      # 快照桥接保护与可恢复解析错误
 ├── data_collection.py   # Python 调度器（运行此文件）
 ├── Cargo.toml
 ├── Cargo.lock
